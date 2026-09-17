@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         menu.delegate = self
+        menu.autoenablesItems = false
         item.menu = menu
         refreshTitle()
         poll()
@@ -124,8 +125,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func info(_ menu: NSMenu, _ text: String) {
+        // Sin acción pero HABILITADAS: deshabilitadas macOS las pinta en gris
+        // (queja de Dani 17-09). El clic no hace nada.
         let it = NSMenuItem(title: text, action: nil, keyEquivalent: "")
-        it.isEnabled = false
+        it.isEnabled = true
         menu.addItem(it)
     }
 
