@@ -9,6 +9,9 @@ let endpoint = ProcessInfo.processInfo.environment["LLM_LIVE_URL"]
     ?? "https://dgx.lan.e-dani.com/api/llm/live"
 let dashboardURL = ProcessInfo.processInfo.environment["LLM_DASHBOARD_URL"]
     ?? "https://dgx.lan.e-dani.com/inferencia"
+// Cola de imagen local (ComfyUI: Krea2, FLUX.2…): /api/image/queue.
+let imageURL = ProcessInfo.processInfo.environment["LLM_IMAGE_URL"]
+    ?? "https://dgx.lan.e-dani.com/api/image/queue"
 let pollSeconds = 30.0
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -16,6 +19,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let menu = NSMenu()
     var timer: Timer?
     var live: [String: Double]?
+    var image: [String: Int]?
+    var imageCurrent: String?
     var lastFetch: Date?
     var errorText: String?
 
@@ -64,28 +69,52 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func poll() {
-        guard let url = URL(string: endpoint) else { return }
+        fetch(endpoint) { [weak self] j in
+            guard let self else { return }
+            if j?["running"] is NSNumber {
+                var m: [String: Double] = [:]
+                for k in ["running", "waiting", "decode_tps", "decode_tps_now"] {
+                    if let v = j?[k] as? NSNumber { m[k] = v.doubleValue }
+                }
+                self.live = m
+                self.lastFetch = Date()
+                self.errorText = nil
+            } else {
+                self.errorText = "sin lectura de /api/llm/live"
+            }
+            self.refreshTitle()
+        }
+        fetch(imageURL) { [weak self] j in
+            guard let self else { return }
+            if let j, j["running"] is NSNumber || j["queue_len"] is NSNumber {
+                var m: [String: Int] = [:]
+                for k in ["running", "queue_len", "pending"] {
+                    if let v = j[k] as? NSNumber { m[k] = v.intValue }
+                }
+                self.image = m
+                // `current` trae el job en marcha; nos quedamos con el preset o
+                // el checkpoint para poder nombrarlo en el menú.
+                if let cur = j["current"] as? [String: Any] {
+                    self.imageCurrent = (cur["preset"] as? String)
+                        ?? (cur["checkpoint"] as? String)
+                        ?? ((cur["checkpoint"] as? [String: Any])?["filename"] as? String)
+                } else {
+                    self.imageCurrent = nil
+                }
+            } else {
+                self.image = nil
+            }
+        }
+    }
+
+    private func fetch(_ urlStr: String, _ done: @escaping ([String: Any]?) -> Void) {
+        guard let url = URL(string: urlStr) else { return done(nil) }
         var req = URLRequest(url: url)
         req.timeoutInterval = 10
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, err in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                if let data,
-                   let j = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-                   j["running"] is NSNumber {
-                    var m: [String: Double] = [:]
-                    for k in ["running", "waiting", "decode_tps", "decode_tps_now"] {
-                        if let v = j[k] as? NSNumber { m[k] = v.doubleValue }
-                    }
-                    self.live = m
-                    self.lastFetch = Date()
-                    self.errorText = nil
-                } else {
-                    self.errorText = err?.localizedDescription ?? "respuesta inválida"
-                }
-                self.refreshTitle()
-            }
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            let j = data.flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] }
+            DispatchQueue.main.async { done(j) }
         }.resume()
     }
 
@@ -112,6 +141,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             info(menu, "Sin lectura de /api/llm/live")
             if let e = errorText { info(menu, "Error: \(e)") }
+        }
+        // Krea2 (cola de imagen local, ComfyUI): en progreso y cola.
+        menu.addItem(.separator())
+        if let img = image {
+            let running = img["running"] ?? 0
+            let cola = img["queue_len"] ?? 0
+            if running > 0 {
+                let que = imageCurrent.map { " — \($0)" } ?? ""
+                info(menu, "Krea2: \(running) en progreso\(que)")
+            } else {
+                info(menu, "Krea2: ocioso")
+            }
+            info(menu, "Krea2 en cola: \(cola)")
+        } else {
+            info(menu, "Krea2: sin lectura de /api/image/queue")
         }
         menu.addItem(.separator())
         add(menu, "Actualizar ahora", #selector(refreshNow), key: "r")
