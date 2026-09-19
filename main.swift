@@ -12,7 +12,7 @@ let dashboardURL = ProcessInfo.processInfo.environment["LLM_DASHBOARD_URL"]
 // Cola de imagen local (ComfyUI: Krea2, FLUX.2…): /api/image/queue.
 let imageURL = ProcessInfo.processInfo.environment["LLM_IMAGE_URL"]
     ?? "https://dgx.lan.e-dani.com/api/image/queue"
-let pollSeconds = 30.0
+let pollSeconds = 10.0
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
