@@ -3,6 +3,10 @@
 // UNA sola lectura de /api/llm/live (dgx.llm.live.v1), cada 30 s.
 // Tono igual que chipTone(): cola abierta = naranja, sirviendo = normal,
 // sin lectura = guion. Nunca rojo.
+//
+// 22-09: sección Compañía (contrato dgx.llm.company.v1) — interruptor, tope,
+// CTOs vivos, cola y reparto del tablero, los mismos contadores que pinta la
+// tarjeta de la home del panel. El chip añade un tramo compacto «🏢 2/2».
 import AppKit
 
 let endpoint = ProcessInfo.processInfo.environment["LLM_LIVE_URL"]
@@ -12,6 +16,11 @@ let dashboardURL = ProcessInfo.processInfo.environment["LLM_DASHBOARD_URL"]
 // Cola de imagen local (ComfyUI: Krea2, FLUX.2…): /api/image/queue.
 let imageURL = ProcessInfo.processInfo.environment["LLM_IMAGE_URL"]
     ?? "https://dgx.lan.e-dani.com/api/image/queue"
+// Compañía en vivo (solo contadores): /api/llm/company (dgx.llm.company.v1).
+let companyURL = ProcessInfo.processInfo.environment["LLM_COMPANY_URL"]
+    ?? "https://dgx.lan.e-dani.com/api/llm/company"
+let companyPageURL = ProcessInfo.processInfo.environment["LLM_COMPANY_PAGE_URL"]
+    ?? "https://dgx.lan.e-dani.com/claude-sessions#compania"
 let pollSeconds = 10.0
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -21,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var live: [String: Double]?
     var image: [String: Int]?
     var imageCurrent: String?
+    var company: [String: Any]?
     var lastFetch: Date?
     var errorText: String?
 
@@ -36,26 +46,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // Tramo de compañía para el título: «🏢 2/2» (CTOs vivos / tope), «🏢 off»
+    // si la empresa está apagada (interruptor, no avería) y «🏢 ?» si está
+    // encendida pero el disparador no contesta. Sin lectura: sin tramo.
+    private func companyTitlePart() -> String? {
+        guard let c = company else { return nil }
+        let encendida = c["encendida"] as? Bool
+        if encendida == false { return "🏢 off" }
+        guard encendida == true else { return nil }
+        let ok = (c["ok"] as? Bool) ?? false
+        guard ok, let activas = c["activas"] as? NSNumber,
+              let tope = c["max_activas"] as? NSNumber else { return "🏢 ?" }
+        return "🏢 \(activas.intValue)/\(tope.intValue)"
+    }
+
     func refreshTitle() {
         guard let b = item.button else { return }
         let running = live?["running"]
-        let text: String
+        var parts: [String] = []
         if let running {
-            var parts = ["\(Int(running)) req"]
+            parts.append("\(Int(running)) req")
             if let w = live?["waiting"], w > 0 { parts.append("\(Int(w)) en cola") }
             if let tps = live?["decode_tps_now"] ?? live?["decode_tps"] {
                 parts.append("\(Int(tps.rounded())) tok/s")
             }
-            text = parts.joined(separator: " · ")
         } else {
-            text = "LLM —"
+            parts.append("LLM —")
         }
+        if let co = companyTitlePart() { parts.append(co) }
+        let text = parts.joined(separator: " · ")
         // Mismo criterio que chipTone() de la navbar: cola = warn, sirviendo = ok
         // (verde), todo cero o sin lectura = muted (gris). Nunca rojo.
+        // La compañía añade su propio warn: cola de épicas > 0.
+        let coCola = (company?["en_cola"] as? NSNumber).map { $0.intValue > 0 } ?? false
         let color: NSColor
         if running == nil {
             color = .secondaryLabelColor
-        } else if (live?["waiting"] ?? 0) > 0 {
+        } else if (live?["waiting"] ?? 0) > 0 || coCola {
             color = .systemOrange
         } else if running! > 0 {
             color = .systemGreen
@@ -104,6 +131,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 self.image = nil
             }
+            self.refreshTitle()
+        }
+        fetch(companyURL) { [weak self] j in
+            guard let self else { return }
+            // `encendida` es la clave-test: el endpoint la sirve siempre (el
+            // agente la lee del disco) aunque el disparador esté parado.
+            if let j, j["encendida"] is NSNumber || j["encendida"] is Bool {
+                self.company = j
+            } else {
+                self.company = nil
+            }
+            self.refreshTitle()
         }
     }
 
@@ -157,6 +196,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             info(menu, "Krea2: sin lectura de /api/image/queue")
         }
+        // Compañía: los contadores de dgx.llm.company.v1. Tres estados se leen
+        // aparte, como en la home del panel: apagada (interruptor, gris),
+        // encendida sin disparador (degradado), y el reparto de Jira, que es
+        // fuente independiente y pinta aunque lo demás falle.
+        menu.addItem(.separator())
+        add(menu, "Abrir compañía", #selector(openCompany), key: "c")
+        if let c = company {
+            let encendida = (c["encendida"] as? Bool) ?? false
+            let ok = (c["ok"] as? Bool) ?? false
+            let servicio = (c["servicio"] as? Bool) ?? false
+            if !encendida {
+                info(menu, "Empresa apagada (interruptor)")
+            } else if ok, let activas = c["activas"] as? NSNumber,
+                      let tope = c["max_activas"] as? NSNumber {
+                info(menu, "CTOs vivos: \(activas.intValue) / tope \(tope.intValue)")
+                if let cola = c["en_cola"] as? NSNumber, cola.intValue > 0 {
+                    info(menu, "Épicas en cola: \(cola.intValue)")
+                }
+            } else {
+                info(menu, "Encendida · sin lectura del disparador"
+                     + (servicio ? "" : " (servicio caído)"))
+            }
+            if let ep = c["epicas"] as? [String: Any], (ep["ok"] as? Bool) ?? false,
+               let curso = ep["curso"] as? NSNumber,
+               let backlog = ep["backlog"] as? NSNumber,
+               let hechas = ep["hechas"] as? NSNumber {
+                info(menu, "Épicas: \(curso.intValue) en curso · \(backlog.intValue) backlog · \(hechas.intValue) hechas")
+            } else {
+                info(menu, "Épicas: sin lectura de Jira")
+            }
+        } else {
+            info(menu, "Compañía: sin lectura de /api/llm/company")
+        }
         menu.addItem(.separator())
         add(menu, "Actualizar ahora", #selector(refreshNow), key: "r")
         add(menu, "Salir", #selector(quit), key: "q")
@@ -178,6 +250,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openDashboard() {
         if let url = URL(string: dashboardURL) { NSWorkspace.shared.open(url) }
+    }
+    @objc func openCompany() {
+        if let url = URL(string: companyPageURL) { NSWorkspace.shared.open(url) }
     }
     @objc func refreshNow() { poll() }
     @objc func quit() { NSApp.terminate(nil) }
