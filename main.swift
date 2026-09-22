@@ -301,6 +301,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: pollSeconds, repeats: true) { [weak self] _ in
             self?.poll()
         }
+        // Verificación visual sin manos (22-09): con esta variable de entorno el
+        // menú se auto-abre a los 2 s — permite capturar el panel con screencapture
+        // en la sesión GUI y comprobar que el item SwiftUI tiene altura real.
+        if ProcessInfo.processInfo.environment["LLM_DEBUG_POPUP"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self else { return }
+                let probe = NSHostingView(rootView: PanelView(model: self.model))
+                probe.layoutSubtreeIfNeeded()
+                let msg = "PANEL fitting=\(probe.fittingSize)\n"
+                FileHandle.standardError.write(msg.data(using: .utf8)!)
+                if let b = self.item.button {
+                    self.menu.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 4), in: b)
+                }
+            }
+        }
     }
 
     func refreshTitle() {
@@ -379,7 +394,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
 
         let host = NSMenuItem()
-        host.view = NSHostingView(rootView: PanelView(model: model))
+        let panel = NSHostingView(rootView: PanelView(model: model))
+        panel.layoutSubtreeIfNeeded()
+        // NSMenu NO respeta el intrinsic size de un view: sin frame explícito el
+        // item colapsa a alto cero y el panel desaparece (medido 22-09 — solo se
+        // veían los ítems nativos). Ancho fijo del diseño; alto, el que pide.
+        let h = panel.fittingSize.height > 10 ? panel.fittingSize.height : 320
+        panel.frame = NSRect(x: 0, y: 0, width: 292, height: h)
+        host.view = panel
         menu.addItem(host)
         menu.addItem(.separator())
 
