@@ -1,28 +1,295 @@
-// LLM Status — chip de la barra de menús del Mac con las mismas dos lecturas
-// que la navbar del dashboard (DGX-96): «N req» y «X tok/s global», ambas de
-// UNA sola lectura de /api/llm/live (dgx.llm.live.v1), cada 30 s.
-// Tono igual que chipTone(): cola abierta = naranja, sirviendo = normal,
-// sin lectura = guion. Nunca rojo.
+// LLM Status — chip de la barra de menús del Mac.
+//
+// 22-09 (rediseño, Dani: «monta el diseño de la home del dashboard con UIKit
+// Apple por defecto»): el desplegable NO es una lista de textos. Es un panel
+// SwiftUI con las tarjetas de la home del panel — Inferencia, Generación y
+// Compañía — con el sistema del DESIGN.md de la épica DGX-338: retícula de
+// 8 pt, dígitos monoespaciados (`.monospacedDigit`), verde=trabajo,
+// naranja=cola, gris=reposo/sin lectura, NUNCA rojo, y píldora de estado en
+// cada tarjeta. Los acciones (abrir panel, actualizar, salir) siguen siendo
+// ítems NATIVOS de NSMenu: atajos de teclado y comportamiento de menú intactos.
+//
+// Datos: UNA tanda cada 10 s contra /api/llm/live (dgx.llm.live.v1),
+// /api/image/queue y /api/llm/company (dgx.llm.company.v1). Cada tarjeta se
+// pinta con lo que tenga: sin lectura = guion gris, nunca pantalla de error.
 import AppKit
+import SwiftUI
 
 let endpoint = ProcessInfo.processInfo.environment["LLM_LIVE_URL"]
     ?? "https://dgx.lan.e-dani.com/api/llm/live"
 let dashboardURL = ProcessInfo.processInfo.environment["LLM_DASHBOARD_URL"]
     ?? "https://dgx.lan.e-dani.com/inferencia"
-// Cola de imagen local (ComfyUI: Krea2, FLUX.2…): /api/image/queue.
 let imageURL = ProcessInfo.processInfo.environment["LLM_IMAGE_URL"]
     ?? "https://dgx.lan.e-dani.com/api/image/queue"
+let companyURL = ProcessInfo.processInfo.environment["LLM_COMPANY_URL"]
+    ?? "https://dgx.lan.e-dani.com/api/llm/company"
+let companyPageURL = ProcessInfo.processInfo.environment["LLM_COMPANY_PAGE_URL"]
+    ?? "https://dgx.lan.e-dani.com/claude-sessions#compania"
 let pollSeconds = 10.0
 
+// ─── modelo ──────────────────────────────────────────────────────────────────
+
+struct LiveStats {
+    var running: Int
+    var waiting: Int
+    var decodeNow: Double?
+    var decodeAvg: Double?
+    var tone: Tone {
+        if waiting > 0 { return .warn }
+        if running > 0 { return .up }
+        return .rest
+    }
+}
+
+struct ImageStats {
+    var running: Int
+    var queue: Int
+    var current: String?
+    var tone: Tone {
+        if queue > 0 { return .warn }
+        if running > 0 { return .up }
+        return .rest
+    }
+}
+
+struct CompanyStats {
+    var ok: Bool            // se habló con el disparador
+    var encendida: Bool     // interruptor (no es avería estar apagada)
+    var servicio: Bool      // el servicio del disparador corre
+    var maxActivas: Int?
+    var activas: Int?
+    var enCola: Int
+    var epicasOk: Bool
+    var curso: Int
+    var backlog: Int
+    var hechas: Int
+    var tone: Tone {
+        if !encendida { return .off }
+        if enCola > 0 || !ok { return .warn }
+        return .up
+    }
+}
+
+enum Tone {
+    case up, warn, rest, off
+    var color: Color {
+        switch self {
+        case .up: return .green
+        case .warn: return .orange
+        case .rest: return .secondary
+        case .off: return .secondary
+        }
+    }
+}
+
+@MainActor
+final class Model: ObservableObject {
+    @Published var live: LiveStats?
+    @Published var image: ImageStats?
+    @Published var company: CompanyStats?
+    @Published var lastFetch: Date?
+
+    var chipTitle: String {
+        var parts: [String] = []
+        if let l = live {
+            parts.append("\(l.running) req")
+            if let t = l.decodeNow ?? l.decodeAvg { parts.append("\(Int(t.rounded())) tok/s") }
+        } else {
+            parts.append("LLM —")
+        }
+        if let c = company {
+            if !c.encendida { parts.append("🏢 off") }
+            else if c.ok, let a = c.activas, let t = c.maxActivas { parts.append("🏢 \(a)/\(t)") }
+            else { parts.append("🏢 ?") }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    var chipTone: Tone {
+        if let l = live {
+            if l.waiting > 0 || (company?.enCola ?? 0) > 0 { return .warn }
+            if l.running > 0 { return .up }
+        }
+        return .rest
+    }
+}
+
+// ─── panel (SwiftUI, sistema del DESIGN.md) ─────────────────────────────────
+
+private let grid: CGFloat = 8
+
+struct PanelView: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: grid * 1.5) {
+            HStack(spacing: grid) {
+                Text("LLM Status")
+                    .font(.system(.headline, design: .rounded, weight: .semibold))
+                Spacer()
+                if let f = model.lastFetch {
+                    Text("hace \(max(0, Int(Date().timeIntervalSince(f)))) s")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            InferenciaCard(live: model.live)
+            GeneracionCard(image: model.image)
+            CompaniaCard(company: model.company)
+        }
+        .padding(grid * 1.5)
+        .frame(width: 292, alignment: .leading)
+    }
+}
+
+private struct Card<Content: View>: View {
+    let title: String
+    let tone: Tone?
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: grid) {
+            HStack(spacing: grid) {
+                Circle()
+                    .fill(tone?.color ?? Color.secondary)
+                    .frame(width: 7, height: 7)
+                Text(title)
+                    .font(.system(.caption, design: .rounded, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .textCase(.uppercase)
+                Spacer()
+            }
+            content
+        }
+        .padding(grid * 1.25)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(nsColor: .quaternarySystemFill).opacity(0.55))
+        )
+    }
+}
+
+private struct Metric: View {
+    let value: String
+    let label: String
+    var tone: Tone = .rest
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(value)
+                .font(.system(.title2, design: .rounded, weight: .semibold))
+                .monospacedDigit()
+                .foregroundStyle(tone == .rest ? Color.primary : tone.color)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(label)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private func dash(_ v: Int?) -> String { v.map(String.init) ?? "—" }
+private func dash(_ v: Double?) -> String { v.map { String(Int($0.rounded())) } ?? "—" }
+
+private struct InferenciaCard: View {
+    let live: LiveStats?
+    var body: some View {
+        Card(title: "Inferencia", tone: live?.tone) {
+            HStack(alignment: .top, spacing: grid) {
+                Metric(value: dash(live?.running), label: "en curso",
+                       tone: (live?.running ?? 0) > 0 ? .up : .rest)
+                Metric(value: dash(live?.waiting), label: "en cola",
+                       tone: (live?.waiting ?? 0) > 0 ? .warn : .rest)
+                Metric(value: dash(live.flatMap { $0.decodeNow ?? $0.decodeAvg }),
+                       label: "tok/s", tone: (live?.decodeNow ?? live?.decodeAvg) != nil ? .up : .rest)
+            }
+            if let avg = live?.decodeAvg, let now = live?.decodeNow, now != avg {
+                Text("media 2 min \(Int(avg.rounded())) tok/s")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
+private struct GeneracionCard: View {
+    let image: ImageStats?
+    var body: some View {
+        Card(title: "Generación · Krea2", tone: image?.tone) {
+            HStack(alignment: .top, spacing: grid) {
+                Metric(value: dash(image?.running), label: "en progreso",
+                       tone: (image?.running ?? 0) > 0 ? .up : .rest)
+                Metric(value: dash(image?.queue), label: "en cola",
+                       tone: (image?.queue ?? 0) > 0 ? .warn : .rest)
+                Spacer()
+            }
+            if let cur = image?.current, (image?.running ?? 0) > 0 {
+                Text(cur).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+    }
+}
+
+private struct CompaniaCard: View {
+    let company: CompanyStats?
+    var body: some View {
+        Card(title: "Compañía", tone: company?.tone) {
+            if let c = company {
+                HStack(spacing: grid) {
+                    Pill(text: c.encendida ? "encendida" : "apagada",
+                         tone: c.encendida ? .up : .off)
+                    if c.encendida && !c.ok {
+                        Pill(text: c.servicio ? "sin lectura" : "disparador caído", tone: .warn)
+                    }
+                    Spacer()
+                    if c.encendida, c.ok {
+                        Text("CTO \(dash(c.activas))/\(dash(c.maxActivas))")
+                            .font(.system(.callout, design: .rounded)).monospacedDigit()
+                    }
+                }
+                HStack(alignment: .top, spacing: grid) {
+                    Metric(value: dash(c.curso), label: "en curso",
+                           tone: c.curso > 0 ? .up : .rest)
+                    Metric(value: dash(c.backlog), label: "backlog", tone: .rest)
+                    Metric(value: dash(c.hechas), label: "hechas", tone: .rest)
+                    Metric(value: dash(c.enCola), label: "en cola",
+                           tone: c.enCola > 0 ? .warn : .rest)
+                }
+                if !c.epicasOk {
+                    Text("tablero Jira sin lectura")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+            } else {
+                Text("sin lectura del panel de compañía")
+                    .font(.caption).foregroundStyle(.tertiary)
+            }
+        }
+    }
+}
+
+private struct Pill: View {
+    let text: String
+    let tone: Tone
+    var body: some View {
+        Text(text)
+            .font(.system(.caption2, design: .rounded, weight: .medium))
+            .foregroundStyle(tone.color)
+            .padding(.horizontal, grid)
+            .padding(.vertical, 2)
+            .background(Capsule().stroke(tone.color.opacity(0.5), lineWidth: 1))
+    }
+}
+
+// ─── app ─────────────────────────────────────────────────────────────────────
+
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var item: NSStatusItem!
     let menu = NSMenu()
+    let model = Model()
     var timer: Timer?
-    var live: [String: Double]?
-    var image: [String: Int]?
-    var imageCurrent: String?
-    var lastFetch: Date?
-    var errorText: String?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -34,35 +301,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         timer = Timer.scheduledTimer(withTimeInterval: pollSeconds, repeats: true) { [weak self] _ in
             self?.poll()
         }
+        // Verificación visual sin manos (22-09): con esta variable de entorno el
+        // menú se auto-abre a los 2 s — permite capturar el panel con screencapture
+        // en la sesión GUI y comprobar que el item SwiftUI tiene altura real.
+        if ProcessInfo.processInfo.environment["LLM_DEBUG_POPUP"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self else { return }
+                let probe = NSHostingView(rootView: PanelView(model: self.model))
+                probe.layoutSubtreeIfNeeded()
+                let msg = "PANEL fitting=\(probe.fittingSize)\n"
+                FileHandle.standardError.write(msg.data(using: .utf8)!)
+                if let b = self.item.button {
+                    self.menu.popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height + 4), in: b)
+                }
+            }
+        }
     }
 
     func refreshTitle() {
         guard let b = item.button else { return }
-        let running = live?["running"]
-        let text: String
-        if let running {
-            var parts = ["\(Int(running)) req"]
-            if let w = live?["waiting"], w > 0 { parts.append("\(Int(w)) en cola") }
-            if let tps = live?["decode_tps_now"] ?? live?["decode_tps"] {
-                parts.append("\(Int(tps.rounded())) tok/s")
-            }
-            text = parts.joined(separator: " · ")
-        } else {
-            text = "LLM —"
-        }
-        // Mismo criterio que chipTone() de la navbar: cola = warn, sirviendo = ok
-        // (verde), todo cero o sin lectura = muted (gris). Nunca rojo.
         let color: NSColor
-        if running == nil {
-            color = .secondaryLabelColor
-        } else if (live?["waiting"] ?? 0) > 0 {
-            color = .systemOrange
-        } else if running! > 0 {
-            color = .systemGreen
-        } else {
-            color = .secondaryLabelColor
+        switch model.chipTone {
+        case .warn: color = .systemOrange
+        case .up: color = .systemGreen
+        default: color = .secondaryLabelColor
         }
-        b.attributedTitle = NSAttributedString(string: text, attributes: [
+        b.attributedTitle = NSAttributedString(string: model.chipTitle, attributes: [
             .foregroundColor: color,
             .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .regular),
         ])
@@ -70,40 +334,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func poll() {
         fetch(endpoint) { [weak self] j in
-            guard let self else { return }
-            if j?["running"] is NSNumber {
-                var m: [String: Double] = [:]
-                for k in ["running", "waiting", "decode_tps", "decode_tps_now"] {
-                    if let v = j?[k] as? NSNumber { m[k] = v.doubleValue }
-                }
-                self.live = m
-                self.lastFetch = Date()
-                self.errorText = nil
-            } else {
-                self.errorText = "sin lectura de /api/llm/live"
+            guard let self, let j, j["running"] is NSNumber else {
+                self?.refreshTitle(); return
             }
+            let n = { (k: String) -> Double? in (j[k] as? NSNumber)?.doubleValue }
+            self.model.live = LiveStats(
+                running: Int(n("running") ?? 0),
+                waiting: Int(n("waiting") ?? 0),
+                decodeNow: n("decode_tps_now"),
+                decodeAvg: n("decode_tps"))
+            self.model.lastFetch = Date()
             self.refreshTitle()
         }
         fetch(imageURL) { [weak self] j in
-            guard let self else { return }
-            if let j, j["running"] is NSNumber || j["queue_len"] is NSNumber {
-                var m: [String: Int] = [:]
-                for k in ["running", "queue_len", "pending"] {
-                    if let v = j[k] as? NSNumber { m[k] = v.intValue }
-                }
-                self.image = m
-                // `current` trae el job en marcha; nos quedamos con el preset o
-                // el checkpoint para poder nombrarlo en el menú.
-                if let cur = j["current"] as? [String: Any] {
-                    self.imageCurrent = (cur["preset"] as? String)
-                        ?? (cur["checkpoint"] as? String)
-                        ?? ((cur["checkpoint"] as? [String: Any])?["filename"] as? String)
-                } else {
-                    self.imageCurrent = nil
-                }
-            } else {
-                self.image = nil
+            guard let self, let j, j["running"] is NSNumber || j["queue_len"] is NSNumber else { return }
+            let i = { (k: String) -> Int in ((j[k] as? NSNumber)?.intValue) ?? 0 }
+            var current: String?
+            if let cur = j["current"] as? [String: Any] {
+                current = (cur["preset"] as? String) ?? (cur["checkpoint"] as? String)
+                    ?? ((cur["checkpoint"] as? [String: Any])?["filename"] as? String)
             }
+            self.model.image = ImageStats(running: i("running"), queue: i("queue_len"), current: current)
+        }
+        fetch(companyURL) { [weak self] j in
+            guard let self else { return }
+            guard let j, j["encendida"] != nil else {
+                self.model.company = nil
+                self.refreshTitle()
+                return
+            }
+            let b = { (k: String) -> Bool in ((j[k] as? NSNumber)?.boolValue) ?? false }
+            let n = { (k: String) -> Int? in (j[k] as? NSNumber).map { Int(truncating: $0) } }
+            let ep = (j["epicas"] as? [String: Any]) ?? [:]
+            let epn = { (k: String) -> Int in ((ep[k] as? NSNumber)?.intValue) ?? 0 }
+            self.model.company = CompanyStats(
+                ok: b("ok"), encendida: b("encendida"), servicio: b("servicio"),
+                maxActivas: n("max_activas"), activas: n("activas"),
+                enCola: n("en_cola") ?? 0,
+                epicasOk: (ep["ok"] as? Bool) ?? false,
+                curso: epn("curso"), backlog: epn("backlog"), hechas: epn("hechas"))
+            self.refreshTitle()
         }
     }
 
@@ -122,41 +392,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+
+        let host = NSMenuItem()
+        let panel = NSHostingView(rootView: PanelView(model: model))
+        panel.layoutSubtreeIfNeeded()
+        // NSMenu NO respeta el intrinsic size de un view: sin frame explícito el
+        // item colapsa a alto cero y el panel desaparece (medido 22-09 — solo se
+        // veían los ítems nativos). Ancho fijo del diseño; alto, el que pide.
+        let h = panel.fittingSize.height > 10 ? panel.fittingSize.height : 320
+        panel.frame = NSRect(x: 0, y: 0, width: 292, height: h)
+        host.view = panel
+        menu.addItem(host)
+        menu.addItem(.separator())
+
         add(menu, "Abrir /inferencia", #selector(openDashboard), key: "o")
-        menu.addItem(.separator())
-        if let l = live {
-            info(menu, "En curso: \(Int(l["running"] ?? 0))")
-            info(menu, "En cola: \(Int(l["waiting"] ?? 0))")
-            if let now = l["decode_tps_now"] {
-                info(menu, "Decode ahora: \(Int(now.rounded())) tok/s global")
-            }
-            if let avg = l["decode_tps"] {
-                info(menu, "Media 2 min: \(Int(avg.rounded())) tok/s")
-            }
-            if let f = lastFetch {
-                let df = DateFormatter()
-                df.dateFormat = "HH:mm:ss"
-                info(menu, "Actualizado: \(df.string(from: f))")
-            }
-        } else {
-            info(menu, "Sin lectura de /api/llm/live")
-            if let e = errorText { info(menu, "Error: \(e)") }
-        }
-        // Krea2 (cola de imagen local, ComfyUI): en progreso y cola.
-        menu.addItem(.separator())
-        if let img = image {
-            let running = img["running"] ?? 0
-            let cola = img["queue_len"] ?? 0
-            if running > 0 {
-                let que = imageCurrent.map { " — \($0)" } ?? ""
-                info(menu, "Krea2: \(running) en progreso\(que)")
-            } else {
-                info(menu, "Krea2: ocioso")
-            }
-            info(menu, "Krea2 en cola: \(cola)")
-        } else {
-            info(menu, "Krea2: sin lectura de /api/image/queue")
-        }
+        add(menu, "Abrir compañía", #selector(openCompany), key: "c")
         menu.addItem(.separator())
         add(menu, "Actualizar ahora", #selector(refreshNow), key: "r")
         add(menu, "Salir", #selector(quit), key: "q")
@@ -168,23 +418,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(it)
     }
 
-    private func info(_ menu: NSMenu, _ text: String) {
-        // Sin acción pero HABILITADAS: deshabilitadas macOS las pinta en gris
-        // (queja de Dani 17-09). El clic no hace nada.
-        let it = NSMenuItem(title: text, action: nil, keyEquivalent: "")
-        it.isEnabled = true
-        menu.addItem(it)
-    }
-
     @objc func openDashboard() {
         if let url = URL(string: dashboardURL) { NSWorkspace.shared.open(url) }
+    }
+    @objc func openCompany() {
+        if let url = URL(string: companyPageURL) { NSWorkspace.shared.open(url) }
     }
     @objc func refreshNow() { poll() }
     @objc func quit() { NSApp.terminate(nil) }
 }
 
 let app = NSApplication.shared
-let delegate = AppDelegate()
+// El arranque de NSApplication corre SIEMPRE en el hilo principal: el cast es
+// legítimo y el compilador no lo sabe en código top-level de main.swift.
+let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
 app.run()
