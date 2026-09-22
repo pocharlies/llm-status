@@ -20,6 +20,10 @@
 // para números con monospacedDigit, verde=trabajo, naranja=cola/atención,
 // gris=reposo o sin lectura. Rojo SOLO donde la home también lo usa (SAI en
 // batería, servicios caídos), con el mismo umbral.
+//
+// 22-09 (Dani: «2 columnas, más grande, sin scroll»): el panel es una retícula
+// SwiftUI de dos columnas (LazyVGrid) de ~640 pt — las seis teselas de la home
+// caben de una vista, sin ScrollView.
 import AppKit
 import SwiftUI
 
@@ -181,20 +185,20 @@ struct PanelView: View {
                         .foregroundStyle((s ?? 99) > 15 ? Color.orange : Color.secondary)
                 }
             }
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: grid) {
-                    InferenciaCard(model: model)
-                    GeneracionCard(model: model)
-                    TraficoCard(model: model)
-                    ServiciosCard(model: model)
-                    SesionesCard(sessions: model.sessions)
-                    CompaniaCard(company: model.company)
-                }
+            // Dos columnas (Dani 22-09): todo a la vista, sin scroll.
+            LazyVGrid(columns: [GridItem(.flexible(), spacing: grid),
+                                GridItem(.flexible(), spacing: grid)],
+                      alignment: .leading, spacing: grid) {
+                InferenciaCard(model: model)
+                CompaniaCard(company: model.company)
+                TraficoCard(model: model)
+                GeneracionCard(model: model)
+                SesionesCard(sessions: model.sessions)
+                ServiciosCard(model: model)
             }
-            .frame(maxHeight: 430)
         }
         .padding(grid * 1.5)
-        .frame(width: 330)
+        .frame(width: 640)
     }
 }
 
@@ -235,7 +239,7 @@ private struct Card<Content: View>: View {
             content
         }
         .padding(grid + 2)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
             .fill(Color(nsColor: .quaternarySystemFill).opacity(0.55)))
     }
@@ -524,10 +528,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let panel = NSHostingView(rootView: PanelView(model: model))
         panel.layoutSubtreeIfNeeded()
         // NSMenu ignora el intrinsic size de los views: sin frame explícito el
-        // item colapsa a alto cero (medido 22-09). El alto se fija al de la
-        // última medición; el ScrollView interior absorbe lo que sobre.
-        let h = panel.fittingSize.height > 10 ? min(panel.fittingSize.height, 560) : 480
-        panel.frame = NSRect(x: 0, y: 0, width: 330, height: h)
+        // item colapsa a alto cero (medido 22-09). Con la retícula de dos
+        // columnas no hay ScrollView: el alto es el fittingSize real.
+        let h = panel.fittingSize.height > 10 ? min(panel.fittingSize.height, 900) : 520
+        panel.frame = NSRect(x: 0, y: 0, width: 640, height: h)
         host.view = panel
         menu.addItem(host)
         menu.addItem(.separator())
