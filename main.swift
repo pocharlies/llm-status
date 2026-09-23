@@ -10,11 +10,20 @@
 // propias del dashboard), más /api/activity?sections=…, /api/compute/mode,
 // /api/service-health y /api/image/queue.
 //
-// Frescura: temporizador maestro de 5 s; cada fuente en su ritmo (compañía e
-// imagen cada 5 s; actividad, perfil y sesiones cada 15 s; servicios cada 20 s
-// — los mismos TTL que respeta el panel). El «hace N s» del cabecero corre con
-// TimelineView de un segundo: NO depende de la última renderización, así que
-// siempre se ve avanzar (queja de Dani 22-09: «pone todo el rato hace 3»).
+// Frescura (23-09, Dani: «refresca lento, parece lageado, quiero req y tok/s en
+// directo»): req/cola/tok/s y la actividad llegan por el MISMO SSE que usa la web
+// (/api/activity/stream?v=2: `vllm` cada ~1 s, `activity` completo cada 15 s,
+// `studio_queues` cada 2 s). Antes salían de /api/llm/live — Prometheus con 10 s
+// de caché encima del scrape — y el número se quedaba quieto 10–30 s. /api/llm/live
+// queda solo de respaldo si el stream se cae. El resto sigue por sondeo con
+// temporizador maestro de 5 s (compañía e imagen cada 5 s; perfil y sesiones cada
+// 15 s; servicios cada 20 s). Temporizadores en `.common`: en el modo por defecto
+// macOS los congela mientras el panel está abierto (el «no refresca en vivo»).
+//
+// Panel: NSPopover con un único NSHostingController creado al arrancar. Antes era
+// un NSMenu que en cada apertura construía un NSHostingView nuevo y medía su
+// fittingSize de forma síncrona (la apertura lenta), y el run loop de tracking
+// del menú no dejaba repintar. El «hace N s» corre con TimelineView de un segundo.
 //
 // Sistema visual: el del DESIGN.md de DGX-338 — retícula de 8 pt, SF Rounded
 // para números con monospacedDigit, verde=trabajo, naranja=cola/atención,
@@ -30,6 +39,8 @@ import SwiftUI
 let base = ProcessInfo.processInfo.environment["LLM_BASE_URL"]
     ?? "https://dgx.lan.e-dani.com"
 let pollSeconds = 5.0
+// LLM_STATUS_DEBUG=1: cada actualización del chip a stderr (fuente y título).
+let debug = ProcessInfo.processInfo.environment["LLM_STATUS_DEBUG"] != nil
 
 // ─── lectura suelta de JSON ──────────────────────────────────────────────────
 
@@ -62,6 +73,78 @@ func poolState(_ cards: [[String: Any]]) -> (text: String, tone: Tone) {
     return ("a cero", .rest)
 }
 
+// ─── SSE ─────────────────────────────────────────────────────────────────────
+
+// Cliente mínimo de text/event-stream: acumula bytes, corta por línea en blanco
+// y entrega (evento, JSON) ya parseado en el hilo principal. Si la conexión se
+// cierra o falla, reconecta a los 2 s; el backend manda `ping` cada 15 s, así
+// que 45 s sin bytes es una conexión muerta.
+final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let url: URL
+    private let onEvent: @MainActor (String, [String: Any]) -> Void
+    private var session: URLSession!
+    private var task: URLSessionDataTask?
+    private var buffer = Data()
+
+    init(url: URL, onEvent: @escaping @MainActor (String, [String: Any]) -> Void) {
+        self.url = url
+        self.onEvent = onEvent
+        super.init()
+        let cfg = URLSessionConfiguration.default
+        cfg.timeoutIntervalForRequest = 45
+        cfg.timeoutIntervalForResource = .infinity
+        cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
+        cfg.urlCache = nil
+        let q = OperationQueue()
+        q.maxConcurrentOperationCount = 1
+        session = URLSession(configuration: cfg, delegate: self, delegateQueue: q)
+    }
+
+    func connect() {
+        var req = URLRequest(url: url)
+        req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        buffer.removeAll()
+        task = session.dataTask(with: req)
+        task?.resume()
+    }
+
+    func urlSession(_ s: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        // sse-starlette termina las líneas en \r\n. El JSON nunca lleva un \r
+        // crudo (va escapado), así que quitarlos todos deja el corte en \n\n.
+        buffer.append(Data(data.filter { $0 != 0x0D }))
+        let sep = Data("\n\n".utf8)
+        while let r = buffer.range(of: sep) {
+            let block = buffer.subdata(in: buffer.startIndex..<r.lowerBound)
+            buffer.removeSubrange(buffer.startIndex..<r.upperBound)
+            dispatch(block)
+        }
+    }
+
+    private func dispatch(_ block: Data) {
+        guard let text = String(data: block, encoding: .utf8) else { return }
+        var event = "message"
+        var payload = ""
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+            if line.hasPrefix("event:") {
+                event = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
+            } else if line.hasPrefix("data:") {
+                if !payload.isEmpty { payload += "\n" }
+                payload += line.dropFirst(5).drop { $0 == " " }
+            }
+        }
+        guard event != "ping", !payload.isEmpty,
+              let j = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any]
+        else { return }
+        let cb = onEvent
+        DispatchQueue.main.async { MainActor.assumeIsolated { cb(event, j) } }
+    }
+
+    func urlSession(_ s: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { [weak self] in self?.connect() }
+    }
+}
+
 // ─── modelo ──────────────────────────────────────────────────────────────────
 
 @MainActor
@@ -76,14 +159,41 @@ final class Model: ObservableObject {
     @Published var lastLive: Date?
 
     private var tick = 0
+    private var lastVllm: Date?      // último evento `vllm` del stream
+    private var lastActivity: Date?  // último `activity`/`activity_delta`
+    private var sse: SSEClient?
+
+    // El stream manda `vllm` cada ~1 s; con 8 s sin él se considera caído y el
+    // chip vuelve a /api/llm/live.
+    private var streamFresh: Bool { lastVllm.map { Date().timeIntervalSince($0) < 8 } ?? false }
+
+    private var onlineEngines: [[String: Any]] {
+        arrIn(activity ?? [:], "vllm").filter { strIn($0, "status") == "online" }
+    }
+
+    // Los tres números del chip. Con el stream vivo salen de los motores online
+    // (misma fórmula que decode_tps_now de /api/llm/live: velocidad por petición
+    // × secuencias en vuelo); sin él, de /api/llm/live.
+    var running: Double? {
+        if streamFresh { return onlineEngines.reduce(0) { $0 + (num($1, "running") ?? 0) } }
+        return num(live, "running")
+    }
+    var waiting: Double? {
+        if streamFresh { return onlineEngines.reduce(0) { $0 + (num($1, "waiting") ?? 0) } }
+        return num(live, "waiting")
+    }
+    var tokps: Double? {
+        if streamFresh {
+            return onlineEngines.reduce(0) { $0 + (num($1, "gen_speed") ?? 0) * (num($1, "running") ?? 0) }
+        }
+        return num(live, "decode_tps_now") ?? num(live, "decode_tps")
+    }
 
     var chipTitle: String {
         var parts: [String] = []
-        if let l = live, let r = num(l, "running") {
+        if let r = running {
             parts.append("\(Int(r)) req")
-            if let t = (num(l, "decode_tps_now") ?? num(l, "decode_tps")) {
-                parts.append("\(Int(t.rounded())) tok/s")
-            }
+            if let t = tokps { parts.append("\(Int(t.rounded())) tok/s") }
         } else { parts.append("LLM —") }
         if let c = company {
             if boolIn(c, "encendida") == false { parts.append("🏢 off") }
@@ -95,26 +205,54 @@ final class Model: ObservableObject {
     }
 
     var chipTone: Tone {
-        if let l = live {
-            if (num(l, "waiting") ?? 0) > 0 { return .warn }
-            if (num(l, "running") ?? 0) > 0 { return .up }
-        }
+        if (waiting ?? 0) > 0 { return .warn }
+        if (running ?? 0) > 0 { return .up }
         return .rest
     }
 
     func start() {
-        poll()
-        Timer.scheduledTimer(withTimeInterval: pollSeconds, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.poll() }
+        if let u = URL(string: base + "/api/activity/stream?v=2") {
+            sse = SSEClient(url: u) { [weak self] ev, j in self?.onStream(ev, j) }
+            sse?.connect()
         }
+        poll()
+        let t = Timer(timeInterval: pollSeconds, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.poll() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+    }
+
+    private func onStream(_ event: String, _ j: [String: Any]) {
+        var a = activity ?? [:]
+        switch event {
+        case "activity":
+            a = j
+            lastActivity = Date()
+        case "activity_delta":
+            for (k, v) in j where k != "_meta" { a[k] = v }
+            lastActivity = Date()
+        case "vllm":
+            a["vllm"] = j["vllm"]
+            lastVllm = Date()
+            lastLive = lastVllm
+        case "live_requests":
+            a["active_requests"] = j["active_requests"]
+        case "studio_queues":
+            a["studio_queues"] = j
+        default:
+            return
+        }
+        activity = a
+        if event == "vllm" { refreshTitle() }
     }
 
     func poll(force: Bool = false) {
         tick = force ? 0 : tick + 1
+        // Respaldo: /api/llm/live solo pinta el chip si el stream está caído.
         fetch(base + "/api/llm/live") { [weak self] j in
             guard let self else { return }
             self.live = num(j, "running") != nil ? j : nil
-            if self.live != nil { self.lastLive = Date() }
+            if self.live != nil, !self.streamFresh { self.lastLive = Date() }
             self.refreshTitle()
         }
         fetch(base + "/api/image/queue") { [weak self] j in self?.image = j }
@@ -126,8 +264,13 @@ final class Model: ObservableObject {
         if force || tick % 3 == 0 {
             fetch(base + "/api/llm/sessions") { [weak self] j in self?.sessions = j }
             fetch(base + "/api/compute/mode") { [weak self] j in self?.mode = j }
-            fetch(base + "/api/activity?sections=vllm,image,gpu,routing,studio_queues,tts,stt,embedding") { [weak self] j in
-                self?.activity = j
+            // La actividad llega por el stream; el sondeo solo si lleva 30 s callado.
+            let stale = lastActivity.map { Date().timeIntervalSince($0) > 30 } ?? true
+            if stale {
+                fetch(base + "/api/activity?sections=vllm,image,gpu,routing,studio_queues,tts,stt,embedding") { [weak self] j in
+                    guard let self, let j, self.lastActivity.map({ Date().timeIntervalSince($0) > 30 }) ?? true else { return }
+                    self.activity = j
+                }
             }
         }
         if force || tick % 4 == 0 {
@@ -136,6 +279,7 @@ final class Model: ObservableObject {
     }
 
     private func refreshTitle() {
+        if debug { FileHandle.standardError.write(Data("\(Date()) \(streamFresh ? "sse" : "poll") \(chipTitle)\n".utf8)) }
         guard let b = AppHolder.item?.button else { return }
         let color: NSColor
         switch chipTone {
@@ -168,8 +312,16 @@ enum AppHolder { static var item: NSStatusItem? }
 
 private let grid: CGFloat = 8
 
+struct PanelActions {
+    var openDashboard: () -> Void
+    var openCompany: () -> Void
+    var refresh: () -> Void
+    var quit: () -> Void
+}
+
 struct PanelView: View {
     @ObservedObject var model: Model
+    let actions: PanelActions
 
     var body: some View {
         VStack(alignment: .leading, spacing: grid) {
@@ -185,17 +337,30 @@ struct PanelView: View {
                         .foregroundStyle((s ?? 99) > 15 ? Color.orange : Color.secondary)
                 }
             }
-            // Dos columnas (Dani 22-09): todo a la vista, sin scroll.
-            LazyVGrid(columns: [GridItem(.flexible(), spacing: grid),
-                                GridItem(.flexible(), spacing: grid)],
-                      alignment: .leading, spacing: grid) {
-                InferenciaCard(model: model)
-                CompaniaCard(company: model.company)
-                TraficoCard(model: model)
-                GeneracionCard(model: model)
-                SesionesCard(sessions: model.sessions)
-                ServiciosCard(model: model)
+            // Dos columnas (Dani 22-09): todo a la vista, sin scroll. Grid y no
+            // LazyVGrid: sin scroll no hay nada que diferir y mide de una pasada.
+            Grid(alignment: .topLeading, horizontalSpacing: grid, verticalSpacing: grid) {
+                GridRow {
+                    InferenciaCard(model: model)
+                    CompaniaCard(company: model.company)
+                }
+                GridRow {
+                    TraficoCard(model: model)
+                    GeneracionCard(model: model)
+                }
+                GridRow {
+                    SesionesCard(sessions: model.sessions)
+                    ServiciosCard(model: model)
+                }
             }
+            HStack(spacing: grid) {
+                Button("Abrir el panel", action: actions.openDashboard).keyboardShortcut("o")
+                Button("Abrir compañía", action: actions.openCompany)
+                Spacer()
+                Button("Actualizar", action: actions.refresh).keyboardShortcut("r")
+                Button("Salir", action: actions.quit).keyboardShortcut("q")
+            }
+            .controlSize(.small)
         }
         .padding(grid * 1.5)
         .frame(width: 640)
@@ -283,10 +448,10 @@ private func di(_ j: [String: Any]?, _ k: String) -> String {
 private struct InferenciaCard: View {
     let model: Model
     var body: some View {
-        let l = model.live ?? [:]
         let engines = arrIn(model.activity ?? [:], "vllm").filter { strIn($0, "status") == "online" }
-        let waiting = num(l, "waiting") ?? 0
-        let running = num(l, "running") ?? 0
+        let waiting = model.waiting ?? 0
+        let running = model.running ?? 0
+        let fmt: (Double?) -> String = { $0.map { String(Int($0.rounded())) } ?? "—" }
         let kvs = engines.compactMap { num($0, "kv_cache_pct") }
         let kvMax = kvs.max()
         let kvTxt = "KV " + (kvMax.map { String(Int($0.rounded())) + "%" } ?? "—")
@@ -297,10 +462,9 @@ private struct InferenciaCard: View {
                 .font(.system(size: 9, design: .monospaced))
                 .foregroundStyle(kvColor))) {
             HStack(alignment: .top, spacing: grid) {
-                Metric(value: di(model.live, "running"), label: "en curso", tone: running > 0 ? .up : .rest)
-                Metric(value: di(model.live, "waiting"), label: "en cola", tone: waiting > 0 ? .warn : .rest)
-                Metric(value: (num(l, "decode_tps_now") ?? num(l, "decode_tps")).map { String(Int($0.rounded())) } ?? "—",
-                       label: "tok/s global", tone: .up)
+                Metric(value: fmt(model.running), label: "en curso", tone: running > 0 ? .up : .rest)
+                Metric(value: fmt(model.waiting), label: "en cola", tone: waiting > 0 ? .warn : .rest)
+                Metric(value: fmt(model.tokps), label: "tok/s global", tone: .up)
             }
             ForEach(Array(engines.enumerated()), id: \.offset) { _, e in
                 let er = Int(num(e, "running") ?? 0)
@@ -508,50 +672,47 @@ private struct Pill: View {
 // ─── app ─────────────────────────────────────────────────────────────────────
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate {
     var item: NSStatusItem!
-    let menu = NSMenu()
+    let popover = NSPopover()
     let model = Model()
 
     func applicationDidFinishLaunching(_ note: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         AppHolder.item = item
-        menu.delegate = self
-        menu.autoenablesItems = false
-        item.menu = menu
+        item.button?.target = self
+        item.button?.action = #selector(togglePanel)
+
+        // Un solo hosting controller para toda la vida de la app: abrir el panel
+        // es mostrarlo, no reconstruirlo ni medirlo. Se mantiene suscrito al
+        // modelo con el panel cerrado, así al abrir ya está al día.
+        let actions = PanelActions(
+            openDashboard: { [weak self] in self?.open(base + "/") },
+            openCompany: { [weak self] in self?.open(base + "/claude-sessions#compania") },
+            refresh: { [weak self] in self?.model.poll(force: true) },
+            quit: { NSApp.terminate(nil) })
+        let host = NSHostingController(rootView: PanelView(model: model, actions: actions))
+        host.sizingOptions = .preferredContentSize
+        popover.contentViewController = host
+        popover.behavior = .transient
+        popover.animates = false
         model.start()
     }
 
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
-        let host = NSMenuItem()
-        let panel = NSHostingView(rootView: PanelView(model: model))
-        panel.layoutSubtreeIfNeeded()
-        // NSMenu ignora el intrinsic size de los views: sin frame explícito el
-        // item colapsa a alto cero (medido 22-09). Con la retícula de dos
-        // columnas no hay ScrollView: el alto es el fittingSize real.
-        let h = panel.fittingSize.height > 10 ? min(panel.fittingSize.height, 900) : 520
-        panel.frame = NSRect(x: 0, y: 0, width: 640, height: h)
-        host.view = panel
-        menu.addItem(host)
-        menu.addItem(.separator())
-        add(menu, "Abrir el panel", #selector(openDashboard), key: "o")
-        add(menu, "Abrir compañía", #selector(openCompany), key: "c")
-        menu.addItem(.separator())
-        add(menu, "Actualizar ahora", #selector(refreshNow), key: "r")
-        add(menu, "Salir", #selector(quit), key: "q")
+    @objc func togglePanel() {
+        guard let b = item.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
     }
 
-    private func add(_ menu: NSMenu, _ title: String, _ action: Selector, key: String) {
-        let it = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        it.target = self
-        menu.addItem(it)
+    private func open(_ url: String) {
+        popover.performClose(nil)
+        NSWorkspace.shared.open(URL(string: url)!)
     }
-
-    @objc func openDashboard() { NSWorkspace.shared.open(URL(string: base + "/")!) }
-    @objc func openCompany() { NSWorkspace.shared.open(URL(string: base + "/claude-sessions#compania")!) }
-    @objc func refreshNow() { model.poll(force: true) }
-    @objc func quit() { NSApp.terminate(nil) }
 }
 
 let app = NSApplication.shared
