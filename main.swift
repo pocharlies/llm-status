@@ -35,10 +35,12 @@
 // caben de una vista, sin ScrollView.
 import AppKit
 import SwiftUI
+import Charts
 
 let base = ProcessInfo.processInfo.environment["LLM_BASE_URL"]
     ?? "https://dgx.lan.e-dani.com"
 let pollSeconds = 5.0
+let historyCap = 120  // muestras de tok/s en la gráfica (~2 min a 1 evento/s)
 // LLM_STATUS_DEBUG=1: cada actualización del chip a stderr (fuente y título).
 let debug = ProcessInfo.processInfo.environment["LLM_STATUS_DEBUG"] != nil
 
@@ -157,6 +159,8 @@ final class Model: ObservableObject {
     @Published var mode: [String: Any]?
     @Published var health: [String: Any]?
     @Published var lastLive: Date?
+    // tok/s de cada evento `vllm` (~1/s): los últimos 2 min, para la gráfica.
+    @Published var tpsHistory: [Double] = []
 
     private var tick = 0
     private var lastVllm: Date?      // último evento `vllm` del stream
@@ -165,7 +169,7 @@ final class Model: ObservableObject {
 
     // El stream manda `vllm` cada ~1 s; con 8 s sin él se considera caído y el
     // chip vuelve a /api/llm/live.
-    private var streamFresh: Bool { lastVllm.map { Date().timeIntervalSince($0) < 8 } ?? false }
+    var streamFresh: Bool { lastVllm.map { Date().timeIntervalSince($0) < 8 } ?? false }
 
     private var onlineEngines: [[String: Any]] {
         arrIn(activity ?? [:], "vllm").filter { strIn($0, "status") == "online" }
@@ -189,20 +193,25 @@ final class Model: ObservableObject {
         return num(live, "decode_tps_now") ?? num(live, "decode_tps")
     }
 
-    var chipTitle: String {
-        var parts: [String] = []
-        if let r = running {
-            parts.append("\(Int(r)) req")
-            if let t = tokps { parts.append("\(Int(t.rounded())) tok/s") }
-        } else { parts.append("LLM —") }
-        if let c = company {
-            if boolIn(c, "encendida") == false { parts.append("🏢 off") }
-            else if boolIn(c, "ok") == true, let a = num(c, "activas"), let t = num(c, "max_activas") {
-                parts.append("🏢 \(Int(a))/\(Int(t))")
-            } else { parts.append("🏢 ?") }
-        }
-        return parts.joined(separator: " · ")
+    // Chip en dos trozos: LLM («15 req · 29 tok/s») y compañía («0/5»); cada uno
+    // va detrás de su SF Symbol en la barra de menús.
+    var chipLLM: String {
+        guard let r = running else { return "—" }
+        var s = "\(Int(r)) req"
+        if let t = tokps { s += " · \(Int(t.rounded())) tok/s" }
+        return s
     }
+
+    var chipCompany: String? {
+        guard let c = company else { return nil }
+        if boolIn(c, "encendida") == false { return "off" }
+        if boolIn(c, "ok") == true, let a = num(c, "activas"), let t = num(c, "max_activas") {
+            return "\(Int(a))/\(Int(t))"
+        }
+        return "?"
+    }
+
+    var chipTitle: String { chipLLM + (chipCompany.map { " · CTO " + $0 } ?? "") }
 
     var chipTone: Tone {
         if (waiting ?? 0) > 0 { return .warn }
@@ -243,7 +252,11 @@ final class Model: ObservableObject {
             return
         }
         activity = a
-        if event == "vllm" { refreshTitle() }
+        if event == "vllm" {
+            tpsHistory.append(tokps ?? 0)
+            if tpsHistory.count > historyCap { tpsHistory.removeFirst(tpsHistory.count - historyCap) }
+            refreshTitle()
+        }
     }
 
     func poll(force: Bool = false) {
@@ -288,10 +301,28 @@ final class Model: ObservableObject {
         case .down: color = .systemRed
         case .rest: color = .secondaryLabelColor
         }
-        b.attributedTitle = NSAttributedString(string: chipTitle, attributes: [
-            .foregroundColor: color,
-            .font: NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .regular),
-        ])
+        let font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize(for: .small), weight: .medium)
+        let t = NSMutableAttributedString()
+        t.append(symbol("bolt.fill", color))
+        t.append(NSAttributedString(string: " " + chipLLM, attributes: [.foregroundColor: color, .font: font]))
+        if let c = chipCompany {
+            let cc: NSColor = c == "off" || c == "?" ? .secondaryLabelColor : .labelColor
+            t.append(NSAttributedString(string: "   ", attributes: [.font: font]))
+            t.append(symbol("building.2.fill", cc))
+            t.append(NSAttributedString(string: " " + c, attributes: [.foregroundColor: cc, .font: font]))
+        }
+        b.attributedTitle = t
+    }
+
+    private func symbol(_ name: String, _ color: NSColor) -> NSAttributedString {
+        let cfg = NSImage.SymbolConfiguration(pointSize: 10.5, weight: .semibold)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        guard let img = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(cfg) else { return NSAttributedString() }
+        let att = NSTextAttachment()
+        att.image = img
+        att.bounds = CGRect(x: 0, y: -1.5, width: img.size.width, height: img.size.height)
+        return NSAttributedString(attachment: att)
     }
 
     private func fetch(_ urlStr: String, _ done: @escaping ([String: Any]?) -> Void) {
@@ -309,6 +340,13 @@ final class Model: ObservableObject {
 enum AppHolder { static var item: NSStatusItem? }
 
 // ─── panel ───────────────────────────────────────────────────────────────────
+//
+// 23-09 (Dani: «mejora el diseño, más moderno»): cabecero con insignia «En vivo»
+// que late mientras llega el stream; tesela protagonista a todo el ancho con el
+// tok/s grande, en curso/cola y la gráfica de los últimos 2 min (Swift Charts);
+// motores y nodos Spark en filas con barra de KV/memoria; el resto de teselas en
+// dos columnas con icono SF Symbols teñido por estado. Los números cambian con
+// transición numérica en vez de saltar.
 
 private let grid: CGFloat = 8
 
@@ -324,46 +362,72 @@ struct PanelView: View {
     let actions: PanelActions
 
     var body: some View {
-        VStack(alignment: .leading, spacing: grid) {
-            HStack(spacing: grid) {
-                Text("LLM Status")
-                    .font(.system(.headline, design: .rounded, weight: .semibold))
-                PerfilPill(mode: model.mode)
-                Spacer()
-                TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                    let s = model.lastLive.map { max(0, Int(ctx.date.timeIntervalSince($0))) }
-                    Text(s == nil ? "leyendo…" : "hace \(s!) s")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle((s ?? 99) > 15 ? Color.orange : Color.secondary)
-                }
-            }
+        VStack(alignment: .leading, spacing: grid * 1.5) {
+            Header(model: model)
+            HeroCard(model: model)
             // Dos columnas (Dani 22-09): todo a la vista, sin scroll. Grid y no
             // LazyVGrid: sin scroll no hay nada que diferir y mide de una pasada.
-            Grid(alignment: .topLeading, horizontalSpacing: grid, verticalSpacing: grid) {
+            Grid(alignment: .topLeading, horizontalSpacing: grid * 1.5, verticalSpacing: grid * 1.5) {
                 GridRow {
-                    InferenciaCard(model: model)
                     CompaniaCard(company: model.company)
+                    SesionesCard(sessions: model.sessions)
                 }
                 GridRow {
                     TraficoCard(model: model)
                     GeneracionCard(model: model)
                 }
                 GridRow {
-                    SesionesCard(sessions: model.sessions)
-                    ServiciosCard(model: model)
+                    ServiciosCard(model: model).gridCellColumns(2)
                 }
             }
-            HStack(spacing: grid) {
-                Button("Abrir el panel", action: actions.openDashboard).keyboardShortcut("o")
-                Button("Abrir compañía", action: actions.openCompany)
-                Spacer()
-                Button("Actualizar", action: actions.refresh).keyboardShortcut("r")
-                Button("Salir", action: actions.quit).keyboardShortcut("q")
-            }
-            .controlSize(.small)
+            Footer(actions: actions)
         }
-        .padding(grid * 1.5)
-        .frame(width: 640)
+        .padding(grid * 2)
+        .frame(width: 680)
+        .animation(.smooth(duration: 0.35), value: model.tpsHistory)
+    }
+}
+
+private struct Header: View {
+    @ObservedObject var model: Model
+    var body: some View {
+        HStack(spacing: grid * 1.25) {
+            Image(systemName: "cpu.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 30, height: 30)
+                .background(LinearGradient(colors: [.green, .teal], startPoint: .topLeading, endPoint: .bottomTrailing),
+                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 0) {
+                Text("DGX").font(.system(.headline, design: .rounded, weight: .bold))
+                Text(URL(string: base)?.host ?? base).font(.caption2).foregroundStyle(.secondary)
+            }
+            PerfilPill(mode: model.mode)
+            Spacer()
+            LiveBadge(last: model.lastLive)
+        }
+    }
+}
+
+private struct LiveBadge: View {
+    let last: Date?
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let s = last.map { max(0, Int(ctx.date.timeIntervalSince($0))) }
+            let live = (s ?? 99) <= 5
+            let c: Color = s == nil ? .secondary : live ? .green : .orange
+            HStack(spacing: 5) {
+                Image(systemName: "circle.fill")
+                    .font(.system(size: 7))
+                    .symbolEffect(.pulse, options: .repeating, isActive: live)
+                Text(s == nil ? "conectando…" : live ? "En vivo" : "hace \(s!) s")
+                    .font(.system(.caption, design: .rounded, weight: .semibold))
+                    .monospacedDigit()
+            }
+            .foregroundStyle(c)
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .background(c.opacity(0.14), in: Capsule())
+        }
     }
 }
 
@@ -371,42 +435,43 @@ private struct PerfilPill: View {
     let mode: [String: Any]?
     var body: some View {
         let m = mode ?? [:]
-        let eff = strIn(m, "effective_mode")
         let phase = strIn(m, "phase")
         let tone: Tone = phase == "ready" ? .up : (phase == nil ? .rest : .warn)
-        let pill = eff.map { $0 + "·" + (strIn(m, "phase") ?? "?") }
-        if let pill {
-            Text(pill)
-                .font(.system(.caption2, design: .rounded, weight: .medium))
-                .foregroundStyle(tone.color)
-                .padding(.horizontal, grid - 2).padding(.vertical, 1)
-                .background(Capsule().stroke(tone.color.opacity(0.5), lineWidth: 1))
+        if let eff = strIn(m, "effective_mode") {
+            Pill(text: eff + (phase.map { " · " + $0 } ?? ""), tone: tone,
+                 icon: "gauge.with.dots.needle.67percent")
         }
     }
 }
 
 private struct Card<Content: View>: View {
     let title: String
+    var icon: String = "square.grid.2x2.fill"
     var tone: Tone = .rest
     var trailing: AnyView? = nil
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: grid - 2) {
-            HStack(spacing: grid - 2) {
-                Circle().fill(tone.color).frame(width: 6, height: 6)
-                Text(title)
-                    .font(.system(.caption2, design: .rounded, weight: .semibold))
-                    .foregroundStyle(.secondary).textCase(.uppercase)
+        let tint = tone == .rest ? Color.secondary : tone.color
+        VStack(alignment: .leading, spacing: grid) {
+            HStack(spacing: grid) {
+                Image(systemName: icon)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 22, height: 22)
+                    .background(tint.opacity(0.15), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                Text(title).font(.system(.subheadline, design: .rounded, weight: .semibold))
                 Spacer()
                 if let trailing { trailing }
             }
             content
         }
-        .padding(grid + 2)
+        .padding(grid * 1.5)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(RoundedRectangle(cornerRadius: 10, style: .continuous)
-            .fill(Color(nsColor: .quaternarySystemFill).opacity(0.55)))
+        .background {
+            RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.primary.opacity(0.045))
+            RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+        }
     }
 }
 
@@ -417,10 +482,11 @@ private struct Metric: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
             Text(value)
-                .font(.system(.title3, design: .rounded, weight: .semibold))
+                .font(.system(.title2, design: .rounded, weight: .semibold))
                 .monospacedDigit().foregroundStyle(tone == .rest ? Color.primary : tone.color)
+                .contentTransition(.numericText())
                 .lineLimit(1).minimumScaleFactor(0.6)
-            Text(label).font(.system(size: 9)).foregroundStyle(.secondary)
+            Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -432,11 +498,36 @@ private struct KV: View {  // fila etiqueta·valor suelta
     var tone: Tone = .rest
     var body: some View {
         HStack(spacing: 4) {
-            Text(k).font(.caption2).foregroundStyle(.secondary)
+            Text(k).font(.caption).foregroundStyle(.secondary)
             Spacer(minLength: 4)
-            Text(v).font(.system(.caption2, design: .rounded)).monospacedDigit()
+            Text(v).font(.system(.caption, design: .rounded, weight: .medium)).monospacedDigit()
                 .foregroundStyle(tone == .rest ? Color.primary : tone.color)
                 .lineLimit(1).truncationMode(.middle)
+        }
+    }
+}
+
+// Barra de ocupación con umbrales: verde, naranja >75 %, rojo >90 % (los de la home).
+private struct Meter: View {
+    let label: String
+    let pct: Double?
+    var warn: Double = 75
+    var crit: Double = 90
+    var body: some View {
+        let p = min(max(pct ?? 0, 0), 100)
+        let c: Color = pct == nil ? .secondary : p > crit ? .red : p > warn ? .orange : .green
+        HStack(spacing: 6) {
+            Text(label).font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+            GeometryReader { g in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.08))
+                    Capsule().fill(c.gradient).frame(width: g.size.width * p / 100)
+                }
+            }
+            .frame(height: 5)
+            Text(pct.map { String(Int($0.rounded())) + "%" } ?? "—")
+                .font(.system(size: 10, weight: .semibold, design: .rounded)).monospacedDigit()
+                .frame(width: 32, alignment: .trailing)
         }
     }
 }
@@ -445,44 +536,150 @@ private func di(_ j: [String: Any]?, _ k: String) -> String {
     (num(j ?? [:], k)).map { String(Int($0.rounded())) } ?? "—"
 }
 
-private struct InferenciaCard: View {
-    let model: Model
+private struct Sparkline: View {
+    let values: [Double]
+    var body: some View {
+        let top = max((values.max() ?? 0) * 1.15, 1)
+        Chart(Array(values.enumerated()), id: \.offset) { p in
+            AreaMark(x: .value("t", p.offset), y: .value("tok/s", p.element))
+                .interpolationMethod(.monotone)
+                .foregroundStyle(LinearGradient(colors: [.green.opacity(0.35), .green.opacity(0.02)],
+                                                startPoint: .top, endPoint: .bottom))
+            LineMark(x: .value("t", p.offset), y: .value("tok/s", p.element))
+                .interpolationMethod(.monotone)
+                .foregroundStyle(Color.green)
+                .lineStyle(StrokeStyle(lineWidth: 1.5, lineCap: .round, lineJoin: .round))
+        }
+        .chartXAxis(.hidden)
+        .chartYAxis(.hidden)
+        .chartLegend(.hidden)
+        .chartXScale(domain: 0...(historyCap - 1))
+        .chartYScale(domain: 0...top)
+    }
+}
+
+private struct HeroCard: View {
+    @ObservedObject var model: Model
     var body: some View {
         let engines = arrIn(model.activity ?? [:], "vllm").filter { strIn($0, "status") == "online" }
-        let waiting = model.waiting ?? 0
+        let nodes = arrIn(model.activity ?? [:], "gpu").filter { strIn($0, "type") != "ups" && num($0, "sys_mem_total_mb") != nil }
         let running = model.running ?? 0
-        let fmt: (Double?) -> String = { $0.map { String(Int($0.rounded())) } ?? "—" }
-        let kvs = engines.compactMap { num($0, "kv_cache_pct") }
-        let kvMax = kvs.max()
-        let kvTxt = "KV " + (kvMax.map { String(Int($0.rounded())) + "%" } ?? "—")
-        let kvColor: Color = (kvMax ?? 0) > 90 ? Tone.down.color : (kvMax ?? 0) > 75 ? Tone.warn.color : Color.secondary
-        Card(title: "Inferencia",
+        let waiting = model.waiting ?? 0
+        let tps = model.tokps
+        let peak = model.tpsHistory.max()
+        Card(title: "Inferencia", icon: "bolt.fill",
              tone: waiting > 0 ? .warn : (running > 0 ? .up : .rest),
-             trailing: AnyView(Text(kvTxt)
-                .font(.system(size: 9, design: .monospaced))
-                .foregroundStyle(kvColor))) {
-            HStack(alignment: .top, spacing: grid) {
-                Metric(value: fmt(model.running), label: "en curso", tone: running > 0 ? .up : .rest)
-                Metric(value: fmt(model.waiting), label: "en cola", tone: waiting > 0 ? .warn : .rest)
-                Metric(value: fmt(model.tokps), label: "tok/s global", tone: .up)
+             trailing: AnyView(Text(model.streamFresh ? "stream · 1 s" : "sondeo · 5 s")
+                .font(.system(size: 10, design: .rounded)).foregroundStyle(.tertiary))) {
+            HStack(alignment: .center, spacing: grid * 3) {
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(alignment: .firstTextBaseline, spacing: 4) {
+                        Text(tps.map { String(Int($0.rounded())) } ?? "—")
+                            .font(.system(size: 46, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .contentTransition(.numericText(value: tps ?? 0))
+                        Text("tok/s").font(.system(.title3, design: .rounded, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text("decode global").font(.caption).foregroundStyle(.secondary)
+                }
+                .fixedSize()
+                VStack(alignment: .leading, spacing: grid) {
+                    Metric(value: String(Int(running)), label: "en curso", tone: running > 0 ? .up : .rest)
+                    Metric(value: String(Int(waiting)), label: "en cola", tone: waiting > 0 ? .warn : .rest)
+                }
+                .frame(width: 70)
+                VStack(alignment: .trailing, spacing: 2) {
+                    Sparkline(values: model.tpsHistory).frame(height: 64)
+                    Text("últimos 2 min" + (peak.map { " · pico \(Int($0.rounded()))" } ?? ""))
+                        .font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit()
+                }
             }
-            ForEach(Array(engines.enumerated()), id: \.offset) { _, e in
-                let er = Int(num(e, "running") ?? 0)
-                let ew = Int(num(e, "waiting") ?? 0)
-                let es = Int((num(e, "gen_speed_total") ?? 0).rounded())
-                KV(k: strIn(e, "name") ?? "motor",
-                   v: "\(er)r·\(ew)c · \(es) tok/s",
-                   tone: er > 0 ? .up : .rest)
-            }
-            let mem = arrIn(model.activity ?? [:], "gpu").first { ($0["type"] as? String) != "ups" && num($0, "sys_mem_total_mb") != nil }
-            if let mem, let used = num(mem, "sys_mem_used_mb"), let tot = num(mem, "sys_mem_total_mb"), tot > 0 {
-                let pct = 100 * used / tot
-                let memLabel = "Memoria " + (strIn(mem, "node") ?? "Spark") + " · " + String(Int(tot / 1024)) + " GiB"
-                KV(k: memLabel,
-                   v: String(format: "%.0f%%", pct),
-                   tone: pct > 95 ? .down : pct > 85 ? .warn : .rest)
-            }
+            if !engines.isEmpty || !nodes.isEmpty { Divider().opacity(0.6) }
+            ForEach(Array(engines.enumerated()), id: \.offset) { _, e in EngineRow(e: e) }
+            ForEach(Array(nodes.enumerated()), id: \.offset) { _, n in NodeRow(n: n) }
         }
+    }
+}
+
+private struct EngineRow: View {
+    let e: [String: Any]
+    var body: some View {
+        let er = Int(num(e, "running") ?? 0)
+        let ew = Int(num(e, "waiting") ?? 0)
+        let es = Int(((num(e, "gen_speed") ?? 0) * Double(er)).rounded())
+        HStack(spacing: grid) {
+            Image(systemName: "server.rack")
+                .font(.system(size: 11)).foregroundStyle(er > 0 ? Color.green : Color.secondary)
+                .frame(width: 16)
+            Text(strIn(e, "name") ?? "motor").font(.system(.callout, weight: .medium)).lineLimit(1)
+            Text(strIn(e, "node") ?? "").font(.caption2).foregroundStyle(.tertiary)
+            Spacer(minLength: grid)
+            Label("\(er)", systemImage: "play.fill").foregroundStyle(er > 0 ? Color.green : Color.secondary)
+            Label("\(ew)", systemImage: "hourglass").foregroundStyle(ew > 0 ? Color.orange : Color.secondary)
+            Text("\(es) tok/s").frame(width: 62, alignment: .trailing)
+            Meter(label: "KV", pct: num(e, "kv_cache_pct")).frame(width: 130)
+        }
+        .font(.system(size: 11, weight: .medium, design: .rounded))
+        .monospacedDigit()
+        .labelStyle(CompactLabel())
+    }
+}
+
+private struct NodeRow: View {
+    let n: [String: Any]
+    var body: some View {
+        let used = num(n, "sys_mem_used_mb") ?? 0
+        let tot = num(n, "sys_mem_total_mb") ?? 0
+        let pct = tot > 0 ? 100 * used / tot : nil
+        let temp = num(n, "temp_c")
+        HStack(spacing: grid) {
+            Image(systemName: "memorychip")
+                .font(.system(size: 11)).foregroundStyle(.secondary).frame(width: 16)
+            Text(strIn(n, "node") ?? "Spark").font(.system(.callout, weight: .medium))
+            Text(tot > 0 ? "\(Int(tot / 1024)) GiB" : "").font(.caption2).foregroundStyle(.tertiary)
+            Spacer(minLength: grid)
+            Label(temp.map { "\(Int($0.rounded()))°" } ?? "—", systemImage: "thermometer.medium")
+                .foregroundStyle((temp ?? 0) > 85 ? Color.orange : Color.secondary)
+            Label(num(n, "util_pct").map { "\(Int($0.rounded()))%" } ?? "—", systemImage: "cpu")
+                .foregroundStyle(.secondary)
+            Label(num(n, "power_w").map { "\(Int($0.rounded())) W" } ?? "—", systemImage: "bolt")
+                .foregroundStyle(.secondary)
+                .frame(width: 62, alignment: .trailing)
+            // Umbrales de memoria de la home: naranja >85 %, rojo >95 %.
+            Meter(label: "RAM", pct: pct, warn: 85, crit: 95).frame(width: 130)
+        }
+        .font(.system(size: 11, weight: .medium, design: .rounded))
+        .monospacedDigit()
+        .labelStyle(CompactLabel())
+    }
+}
+
+private struct CompactLabel: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 3) {
+            configuration.icon.font(.system(size: 9))
+            configuration.title
+        }
+    }
+}
+
+private struct Footer: View {
+    let actions: PanelActions
+    var body: some View {
+        HStack(spacing: grid) {
+            Button(action: actions.openDashboard) { Label("Panel", systemImage: "safari") }
+                .keyboardShortcut("o")
+            Button(action: actions.openCompany) { Label("Compañía", systemImage: "building.2") }
+            Spacer()
+            Button(action: actions.refresh) { Label("Actualizar", systemImage: "arrow.clockwise") }
+                .keyboardShortcut("r")
+            Button(action: actions.quit) { Label("Salir", systemImage: "power") }
+                .keyboardShortcut("q")
+        }
+        .buttonStyle(.bordered)
+        .buttonBorderShape(.capsule)
+        .controlSize(.small)
     }
 }
 
@@ -507,7 +704,7 @@ private struct GeneracionCard: View {
             .first { (num($0, "running") ?? 0) > 0 }
         let cur = dictIn(model.image ?? [:], "current")
         let curName = strIn(cur, "preset") ?? strIn(dictIn(cur, "checkpoint"), "filename")
-        Card(title: "Generación", tone: kreaTone == .rest && cqRun > 0 ? .up : kreaTone) {
+        Card(title: "Generación", icon: "wand.and.stars", tone: kreaTone == .rest && cqRun > 0 ? .up : kreaTone) {
             KV(k: "Krea 2 · \(laneId == "comfyui" ? "DGX2" : "RTX")",
                v: lr > 0 ? "generando" : lp > 0 ? "\(Int(lp)) en cola"
                   : strIn(lane ?? [:], "status") == "online" ? "lista" : "en reposo",
@@ -540,7 +737,7 @@ private struct TraficoCard: View {
         let voiceDown = voice.filter { $0.1.tone == .down }.count
         let ups = arrIn(model.activity ?? [:], "gpu").first { strIn($0, "type") == "ups" }
         let upsTone: Tone = ups == nil ? .rest : boolIn(ups!, "ups_online") == false ? .down : boolIn(ups!, "low_battery") == true ? .warn : .up
-        Card(title: "Tráfico y voz", tone: (err ?? 0) > 10 ? .down : (err ?? 0) > 2 || voiceDown > 0 ? .warn : .up) {
+        Card(title: "Tráfico y voz", icon: "waveform", tone: (err ?? 0) > 10 ? .down : (err ?? 0) > 2 || voiceDown > 0 ? .warn : .up) {
             HStack(alignment: .top, spacing: grid) {
                 Metric(value: req24 > 0 ? String(Int(req24)) : "—", label: "req 24 h", tone: .rest)
                 Metric(value: err.map { String(format: "%.1f%%", $0) } ?? "—", label: "error 24 h",
@@ -566,7 +763,7 @@ private struct ServiciosCard: View {
         let groups = arrIn(h, "groups")
         let att = groups.filter { ["down", "degraded", "unknown"].contains(strIn($0, "state") ?? "") }
         let tone: Tone = strIn(h, "state") == "up" ? .up : strIn(h, "state") == "down" ? .down : h.isEmpty ? .rest : .warn
-        Card(title: "Servicios", tone: tone) {
+        Card(title: "Servicios", icon: "checkmark.shield.fill", tone: tone) {
             HStack(spacing: grid - 2) {
                 Text(groups.isEmpty ? "—" : "\(groups.count - att.count)/\(groups.count)")
                     .font(.system(.title3, design: .rounded, weight: .semibold)).monospacedDigit()
@@ -589,7 +786,7 @@ private struct SesionesCard: View {
         let s = sessions ?? [:]
         let marcha = num(s, "en_marcha") ?? 0
         let espera = num(s, "te_espera") ?? 0
-        Card(title: "Sesiones Claude", tone: espera > 0 ? .warn : marcha > 0 ? .up : .rest) {
+        Card(title: "Sesiones Claude", icon: "terminal.fill", tone: espera > 0 ? .warn : marcha > 0 ? .up : .rest) {
             HStack(alignment: .top, spacing: grid) {
                 Metric(value: di(s, "en_marcha"), label: "en marcha", tone: marcha > 0 ? .up : .rest)
                 Metric(value: di(s, "te_espera"), label: "te esperan", tone: espera > 0 ? .warn : .rest)
@@ -608,7 +805,7 @@ private struct CompaniaCard: View {
         let ok = boolIn(c, "ok") == true
         let cola = num(c, "en_cola") ?? 0
         let tone: Tone = c.isEmpty ? .rest : !encendida ? .rest : (cola > 0 || !ok) ? .warn : .up
-        Card(title: "Compañía", tone: tone) {
+        Card(title: "Compañía", icon: "building.2.fill", tone: tone) {
             if c.isEmpty {
                 Text("sin lectura de /api/llm/company").font(.caption2).foregroundStyle(.tertiary)
             } else {
@@ -660,12 +857,15 @@ private struct CompaniaCard: View {
 private struct Pill: View {
     let text: String
     let tone: Tone
+    var icon: String? = nil
     var body: some View {
-        Text(text)
-            .font(.system(.caption2, design: .rounded, weight: .medium))
-            .foregroundStyle(tone.color)
-            .padding(.horizontal, grid).padding(.vertical, 2)
-            .background(Capsule().stroke(tone.color.opacity(0.5), lineWidth: 1))
+        HStack(spacing: 4) {
+            if let icon { Image(systemName: icon).font(.system(size: 9, weight: .semibold)) }
+            Text(text).font(.system(.caption, design: .rounded, weight: .semibold))
+        }
+        .foregroundStyle(tone.color)
+        .padding(.horizontal, grid + 1).padding(.vertical, 3)
+        .background(tone.color.opacity(0.14), in: Capsule())
     }
 }
 
